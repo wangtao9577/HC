@@ -137,6 +137,31 @@ Upload notes for this repository:
 - `run_gp3_hc_backtest.py --use-agg` is the highest-fidelity live-like mode when Binance aggTrades are available.
 - `cache/` and `output/` are runtime artifacts and are intentionally excluded from version control.
 
+## BOLL Runner Notes
+
+`run_boll2_hc_backtest.py` now defaults to:
+
+- profile: `d:/project/hc/profiles/boll3_live_latest.env`
+- BOLL latest live-like breakeven profile:
+  - `BREAKEVEN_TRIGGER_PCT=0.019`
+  - `BREAKEVEN_OFFSET_PCT=0.0008`
+- current stop profile:
+  - `STOP_OFFSET_PCT=0.021`
+  - `STOP_CAP_PCT=0.05`
+- latest entry execution mode:
+  - `ENTRY_EXEC_MODE=maker_reprice_2ticks_2x_then_taker`
+  - `POST_ONLY_REPRICE_TICKS=2`
+  - `POST_ONLY_MAX_REPRICE_ATTEMPTS=2`
+
+Important note:
+
+- the BOLL runner uses HC as the execution/matching layer
+- when entry reject probing is enabled, it reuses the BOLL-side aggTrade probe logic to approximate:
+  - post-only reject
+  - repricing attempts
+  - taker fallback
+- full tape-accurate reject behavior still depends on aggTrades availability
+
 Live execution event import:
 
 ```powershell

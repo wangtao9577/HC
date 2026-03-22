@@ -654,6 +654,12 @@ class Boll2HcStrategy:
         self.stop_order_id: Optional[str] = None
         self.be_triggered = False
         self._seen_fills = 0
+        self.entry_exec_mode = str(getattr(self.b, "ENTRY_EXEC_MODE", "baseline") or "baseline").strip().lower()
+        self.rejected_entries = 0
+        self.repriced_entries = 0
+        self.market_fallback_entries = 0
+        self.direct_taker_entries = 0
+        self._probe_cache: dict[int, Optional[list[dict]]] = {}
 
     def on_bar_open(self, engine: BacktestEngine, bar: Bar) -> None:
         self.cur_idx = self.idx_by_open.get(int(bar.open_time_ms), -1)
@@ -683,21 +689,15 @@ class Boll2HcStrategy:
                 cash = float(engine.state.cash)
                 qty_v = self.b.floor_to_step((cash * float(self.b.POSITION_MULT)) / max(px, 1e-12), float(self.rules.step_size))
                 if float(qty_v) >= float(self.rules.min_qty):
-                    oid = engine.place_limit(
+                    self._submit_entry(
+                        engine,
+                        ts_ms=int(bar.open_time_ms),
+                        signal_side=signal_side,
+                        signal_basis=float(ev["basis"]),
                         side=side,
                         qty=float(qty_v),
-                        limit_price=float(px),
-                        ts_ms=int(bar.open_time_ms),
-                        tif=TimeInForce.GTX,
-                        reduce_only=False,
-                        reason=f"boll_entry_{signal_side.lower()}",
+                        base_px=float(px),
                     )
-                    self.pending_entry = {
-                        "order_id": oid,
-                        "signal_side": signal_side,
-                        "signal_basis": float(ev["basis"]),
-                        "expire_ts_ms": int(bar.open_time_ms) + int(self.b.ORDER_TIMEOUT_MS),
-                    }
 
         qty, _ = engine.get_position()
         if qty != 0.0 and self.pending_exit is None and self.pending_entry is None:
@@ -724,6 +724,187 @@ class Boll2HcStrategy:
             reason="boll_exit_signal",
         )
         self.pending_exit = {"order_id": oid, "expire_ts_ms": int(ts_ms) + int(self.b.ORDER_TIMEOUT_MS)}
+
+    def _submit_entry(
+        self,
+        engine: BacktestEngine,
+        *,
+        ts_ms: int,
+        signal_side: str,
+        signal_basis: float,
+        side: Side,
+        qty: float,
+        base_px: float,
+    ) -> None:
+        mode = self.entry_exec_mode
+        if mode == "always_taker":
+            self._place_entry_market(
+                engine,
+                ts_ms=ts_ms,
+                signal_side=signal_side,
+                signal_basis=signal_basis,
+                side=side,
+                qty=qty,
+                reason=f"boll_entry_{signal_side.lower()}_direct_taker",
+            )
+            self.direct_taker_entries += 1
+            return
+
+        probe_rows = self._load_probe_rows(ts_ms) if mode != "baseline" else None
+        reject_row = None
+        order_side = str(side.value)
+        if probe_rows:
+            reject_row = self.b.detect_post_only_reject(probe_rows, order_side, float(base_px), float(self.rules.tick_size))
+
+        if reject_row is None:
+            self._place_entry_limit(
+                engine,
+                ts_ms=ts_ms,
+                signal_side=signal_side,
+                signal_basis=signal_basis,
+                side=side,
+                qty=qty,
+                price=float(base_px),
+                tif=TimeInForce.GTX,
+            )
+            return
+
+        self.rejected_entries += 1
+        if mode == "reject_skip":
+            return
+
+        if mode == "reject_to_taker":
+            self._place_entry_market(
+                engine,
+                ts_ms=ts_ms,
+                signal_side=signal_side,
+                signal_basis=signal_basis,
+                side=side,
+                qty=qty,
+                reason=f"boll_entry_{signal_side.lower()}_fallback_taker",
+            )
+            self.market_fallback_entries += 1
+            return
+
+        if mode != "maker_reprice_2ticks_2x_then_taker":
+            raise RuntimeError(f"unsupported ENTRY_EXEC_MODE={mode}")
+
+        max_attempts = max(int(getattr(self.b, "POST_ONLY_MAX_REPRICE_ATTEMPTS", 2) or 2), 0)
+        for attempt in range(1, max_attempts + 1):
+            reprice_px = float(
+                self.b.repriced_entry_price(order_side, float(base_px), float(self.rules.tick_size), int(attempt))
+            )
+            reprice_match = None
+            if probe_rows:
+                reprice_match = self.b.detect_post_only_reject(
+                    probe_rows,
+                    order_side,
+                    float(reprice_px),
+                    float(self.rules.tick_size),
+                )
+            if reprice_match is None:
+                self._place_entry_limit(
+                    engine,
+                    ts_ms=ts_ms,
+                    signal_side=signal_side,
+                    signal_basis=signal_basis,
+                    side=side,
+                    qty=qty,
+                    price=float(reprice_px),
+                    tif=TimeInForce.GTX,
+                    fallback_kind="reprice",
+                    reprice_attempt=int(attempt),
+                )
+                self.repriced_entries += 1
+                return
+
+        self._place_entry_market(
+            engine,
+            ts_ms=ts_ms,
+            signal_side=signal_side,
+            signal_basis=signal_basis,
+            side=side,
+            qty=qty,
+            reason=f"boll_entry_{signal_side.lower()}_fallback_taker",
+            fallback_kind="market",
+            reprice_attempt=max(max_attempts, 1),
+        )
+        self.market_fallback_entries += 1
+
+    def _place_entry_limit(
+        self,
+        engine: BacktestEngine,
+        *,
+        ts_ms: int,
+        signal_side: str,
+        signal_basis: float,
+        side: Side,
+        qty: float,
+        price: float,
+        tif: TimeInForce,
+        fallback_kind: str = "",
+        reprice_attempt: int = 0,
+    ) -> None:
+        oid = engine.place_limit(
+            side=side,
+            qty=float(qty),
+            limit_price=float(price),
+            ts_ms=int(ts_ms),
+            tif=tif,
+            reduce_only=False,
+            reason=f"boll_entry_{signal_side.lower()}",
+        )
+        self.pending_entry = {
+            "order_id": oid,
+            "signal_side": signal_side,
+            "signal_basis": float(signal_basis),
+            "expire_ts_ms": int(ts_ms) + int(self.b.ORDER_TIMEOUT_MS),
+            "fallback_kind": str(fallback_kind or ""),
+            "reprice_attempt": int(reprice_attempt),
+        }
+
+    def _place_entry_market(
+        self,
+        engine: BacktestEngine,
+        *,
+        ts_ms: int,
+        signal_side: str,
+        signal_basis: float,
+        side: Side,
+        qty: float,
+        reason: str,
+        fallback_kind: str = "",
+        reprice_attempt: int = 0,
+    ) -> None:
+        # Submit 1ms before the bar-open event so the first intrabar event can execute as taker.
+        submit_ts = max(int(ts_ms) - 1, 0)
+        oid = engine.place_market(
+            side=side,
+            qty=float(qty),
+            ts_ms=submit_ts,
+            reduce_only=False,
+            reason=str(reason),
+        )
+        self.pending_entry = {
+            "order_id": oid,
+            "signal_side": signal_side,
+            "signal_basis": float(signal_basis),
+            "expire_ts_ms": int(ts_ms) + int(self.b.ORDER_TIMEOUT_MS),
+            "fallback_kind": str(fallback_kind or "direct_taker"),
+            "reprice_attempt": int(reprice_attempt),
+        }
+
+    def _load_probe_rows(self, ts_ms: int) -> Optional[list[dict]]:
+        cache_key = int(ts_ms)
+        if cache_key in self._probe_cache:
+            return self._probe_cache[cache_key]
+        try:
+            rows = self.b.load_probe_rows(str(getattr(self.b, "SYMBOL", "ETHUSDC")).upper(), int(ts_ms))
+            self._probe_cache[cache_key] = rows
+            return rows
+        except Exception:
+            self._probe_cache[cache_key] = None
+            return None
 
     def on_price_event(self, engine: BacktestEngine, event) -> None:
         self._sync_fills(engine)
@@ -967,6 +1148,15 @@ def run(args) -> dict:
             "wins": wins,
             "losses": losses,
             "win_rate_pct": win_rate,
+            "entry_exec_mode": str(getattr(strategy, "entry_exec_mode", "baseline")),
+            "rejected_entries": int(getattr(strategy, "rejected_entries", 0)),
+            "repriced_entries": int(getattr(strategy, "repriced_entries", 0)),
+            "market_fallback_entries": int(getattr(strategy, "market_fallback_entries", 0)),
+            "direct_taker_entries": int(getattr(strategy, "direct_taker_entries", 0)),
+            "post_only_reprice_ticks": int(max(int(getattr(boll, "POST_ONLY_REPRICE_TICKS", 2) or 2), 1)),
+            "post_only_max_reprice_attempts": int(
+                max(int(getattr(boll, "POST_ONLY_MAX_REPRICE_ATTEMPTS", 2) or 2), 0)
+            ),
             "engine_summary": stats,
             "final_position": {
                 "qty": float(final_pos_qty),
@@ -992,7 +1182,7 @@ def run(args) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run BOLL2.0plus strategy on HC engine")
-    ap.add_argument("--profile", default="d:/project/BOLL2.1/profiles/gen2_plus_profile_cap1000.env")
+    ap.add_argument("--profile", default="d:/project/hc/profiles/boll3_live_latest.env")
     ap.add_argument("--days", type=float, default=365.0)
     ap.add_argument("--start-utc", default="", help="Backtest window start in UTC, e.g. 2025-03-17T10:11:00+00:00")
     ap.add_argument("--end-utc", default="", help="Backtest window end in UTC, e.g. 2025-04-01T00:00:00+00:00")
@@ -1059,6 +1249,7 @@ def main() -> None:
     print(f"  symbol: {stats['symbol']}")
     print(f"  period: {stats['window_start_utc']} -> {stats['window_end_utc']}")
     print(f"  use_agg: {stats['use_agg']}, path_mode: {stats['path_mode']}")
+    print(f"  entry_exec_mode: {stats['entry_exec_mode']}")
     print(f"  bars_1m: {stats['bars_1m']}, entry_events: {stats['entry_events']}, round_trips: {stats['round_trips']}")
     print(f"  ending_equity: {es.get('ending_equity')}")
     print(f"  net_return_pct: {es.get('net_return_pct')}")
